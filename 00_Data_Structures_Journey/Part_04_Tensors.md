@@ -238,6 +238,191 @@ This is the **chain rule** applied automatically. No manual math needed.
 
 ---
 
+## What's Actually Inside a Tensor (Programmatically)
+
+A PyTorch tensor is a Python wrapper around a C++ object (`at::Tensor`). Here's what it holds:
+
+```
+┌─────────────────────────────────────────────────┐
+│  torch.Tensor (Python wrapper)                  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │  Storage (raw data)                       │  │
+│  │  - data_ptr → contiguous block of memory  │  │
+│  │  - dtype (float32, int64, etc.)           │  │
+│  │  - device (CPU/CUDA)                      │  │
+│  │  - nbytes                                 │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │  Metadata (view into storage)             │  │
+│  │  - shape/size                             │  │
+│  │  - stride (step size per dimension)       │  │
+│  │  - offset                                 │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │  Autograd Metadata (if requires_grad=True)│  │
+│  │  - grad_fn → pointer to backward function │  │
+│  │  - grad → accumulated gradient tensor     │  │
+│  │  - requires_grad (bool flag)              │  │
+│  │  - is_leaf (bool)                         │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+```
+
+### Why It's Faster Than a Python List (Basic Array)
+
+```
+Python List [1.0, 2.0, 3.0]:
+  → 3 separate Python float objects scattered on the heap
+  → Each has reference count, type pointer, value
+  → ~28 bytes PER float object + 8 bytes pointer in list
+  → Total: ~108 bytes for 3 numbers
+  → To multiply: Python loop, unbox each float, multiply, rebox, store
+
+Tensor [1.0, 2.0, 3.0] (float32):
+  → 12 contiguous bytes (3 × 4 bytes), nothing else
+  → One C++ kernel call processes ALL elements
+  → No Python loop, no boxing/unboxing
+  → Total: 12 bytes for 3 numbers
+```
+
+### The grad_fn Chain (How the Computation Graph is Built)
+
+When `requires_grad=True`, each operation creates a `grad_fn` node that forms a linked graph:
+
+```python
+x = torch.tensor(3.0, requires_grad=True)  # leaf, grad_fn = None
+t1 = x ** 2        # t1.grad_fn = PowBackward0 → stores "parent=x, exponent=2"
+t2 = 2 * x         # t2.grad_fn = MulBackward0 → stores "parent=x, multiplier=2"
+y = t1 + t2 + 1    # y.grad_fn = AddBackward0 → points to t1 and t2's grad_fns
+```
+
+Each `grad_fn` stores:
+- Pointer to **parent node(s)** (forming a DAG — Directed Acyclic Graph)
+- **Saved values** needed to compute the derivative (e.g., exponent `2` for PowBackward)
+
+When you call `y.backward()`, it walks this chain in reverse, applying the chain rule at each node.
+
+### Inspect It Yourself
+
+```python
+x = torch.tensor(3.0, requires_grad=True)
+y = x ** 2 + 2 * x + 1
+
+print(x.storage())                # raw memory: [3.0]
+print(x.stride())                 # (1,) — step size
+print(x.data_ptr())               # actual memory address (integer)
+print(y.grad_fn)                  # AddBackward0
+print(y.grad_fn.next_functions)   # parent nodes in the graph
+```
+
+---
+
+## Contiguous vs Non-Contiguous Memory
+
+This is about **how elements are physically laid out in memory** vs how you logically see them.
+
+### Contiguous = Elements Stored in Order, No Gaps
+
+```
+Logical view (2×3 matrix):
+[[1, 2, 3],
+ [4, 5, 6]]
+
+Physical memory (row-major / C-contiguous):
+[1, 2, 3, 4, 5, 6]  ← one continuous block, row after row
+
+Stride = (3, 1)
+  → Next row: jump 3 positions in memory
+  → Next column: jump 1 position in memory
+```
+
+### Non-Contiguous = Logical Order ≠ Physical Order
+
+```python
+x = torch.tensor([[1, 2, 3],
+                  [4, 5, 6]])
+
+y = x.t()  # transpose — NO data is copied!
+```
+
+After transpose, you logically see:
+```
+[[1, 4],
+ [2, 5],
+ [3, 6]]
+```
+
+But physical memory is still `[1, 2, 3, 4, 5, 6]`. PyTorch just changed the strides:
+
+```
+Original x:  stride = (3, 1)  → next row: +3, next col: +1
+Transposed:  stride = (1, 3)  → next row: +1, next col: +3
+```
+
+The elements you read "in order" are now scattered in memory — that's non-contiguous.
+
+### Visual Summary
+
+```
+CONTIGUOUS (stride matches shape):
+Memory:  [a][b][c][d][e][f]
+Reading: [a][b][c][d][e][f]  ← sequential, cache-friendly ✓
+
+NON-CONTIGUOUS (stride jumps around):
+Memory:  [a][b][c][d][e][f]
+Reading: [a]      [d]         ← row 0
+            [b]      [e]      ← row 1
+               [c]      [f]   ← row 2
+                              ← jumping around, cache-unfriendly ✗
+```
+
+### Why Does It Matter?
+
+1. **Speed** — CPUs/GPUs load memory in chunks (cache lines). Sequential access = fast. Jumping around = cache misses = slow.
+
+2. **Some operations require contiguous data** — they'll error out or silently call `.contiguous()` which copies data into a fresh contiguous block.
+
+### Operations That Make Tensors Non-Contiguous
+
+```python
+x.t()              # transpose
+x.permute(2, 0, 1) # reorder dimensions
+x.narrow(0, 1, 2)  # slice a subset
+x[::2]             # step slicing
+```
+
+All of these reuse the same memory with different strides — no copy, but non-contiguous.
+
+### How to Fix It
+
+```python
+x = torch.tensor([[1, 2, 3],
+                  [4, 5, 6]])
+
+y = x.t()
+print(y.is_contiguous())    # False
+print(y.stride())           # (1, 3) — jumping around
+
+z = y.contiguous()          # copies into fresh contiguous memory
+print(z.is_contiguous())    # True
+print(z.stride())           # (2, 1) — proper layout for 3×2 matrix
+```
+
+### The Key Insight: Views vs Copies
+
+```
+View (non-contiguous):  Same memory, different stride → FREE but scattered
+Copy (contiguous):      New memory, proper layout → COSTS memory but fast access
+
+PyTorch prefers views (no copy) for efficiency.
+You only pay the copy cost when you actually need contiguous data.
+```
+
+---
+
 ## The Evolution — Complete Picture
 
 ```
